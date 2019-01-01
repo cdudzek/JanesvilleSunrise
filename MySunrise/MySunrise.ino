@@ -16,7 +16,8 @@
  *  Change encLow and encHigh to the pins attached to your rotary encoder. They do not need to be interrupt-capable pins. 
  *  Change encBtn to one pin attached to the rotary encoder's button. This does not need to be an interrupt-capable pin. 
  *  Attach the rotary common/center pin to ground.
- *  Connect the other rotary button pin with a 10K resistor to ground (like a standard input button). 
+ *  Connect the other rotary button pin with a 10K resistor to ground (like a standard input button).
+ *  To change the direction of the dial (CW / CCW) just reverse the encLow and encHigh values or swap the wires on the encoder itself.
  *  
  *  Change the address of your 7-Seg LED at SEVENSEG_ADDR if necessary.
  *  
