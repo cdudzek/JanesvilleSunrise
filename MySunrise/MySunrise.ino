@@ -62,21 +62,65 @@
 #include <Adafruit_LEDBackpack.h>
 #include <ClickEncoder.h>
 #include <EEPROM.h>
+#include <LiquidCrystal.h>
 #include <RTClib.h>
 #include <TimerOne.h>
 
+// TODO: Quick settings for Teensy or Mega pinouts
+#define USING_TEENSY_SETTINGS
+//#define USING_MEGA_SETTINGS
+
 // TODO: Update pins for LED output and encoder/button if necessary
+#ifdef USING_MEGA_SETTINGS
 #define ledPin    8
 #define encLow    2
 #define encHigh   3
 #define encBtn    19
+// LCD character display pins (14-pin or 16-pin header)
+// 1=GND, 2=+5v, 3=Pot/Contrast, 4=RS, 5=RW/GND, 6=EN, 7-10=empty, 11-14=DS4-DS7, 15=+Backlight, 16=-Backlight
+#define LCD_RS    9
+#define LCD_EN    10
+#define LCD_D4    4
+#define LCD_D5    5
+#define LCD_D6    6
+#define LCD_D7    7
+bool USE_LCD = true;
+bool USE_SEVENSEG = false;
+
+#elif defined USING_TEENSY_SETTINGS
+#define ledPin    9
+#define encLow    15
+#define encHigh   16
+#define encBtn    12
+// LCD character display pins (14-pin or 16-pin header)
+// 1=GND, 2=+5v, 3=Pot/Contrast, 4=RS, 5=RW/GND, 6=EN, 7-10=empty, 11-14=DS4-DS7, 15=+Backlight, 16=-Backlight
+#define LCD_RS    9
+#define LCD_EN    10
+#define LCD_D4    4
+#define LCD_D5    5
+#define LCD_D6    6
+#define LCD_D7    7
+bool USE_LCD = false;
+bool USE_SEVENSEG = true;
+#endif
 
 // TODO: Update the I2C address for the 7-Segment LED backpack if necessary
 #define SEVENSEG_ADDR  0x70
 
+// TODO: Update for 16x2 or 20x4 LCD display
+#define LCD_ROWS 4
+#define LCD_COLS 20
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+
 // TODO: Amount of time (in seconds) to fade in the lighting
 // 20 minutes:
-#define TIME_TO_FADE (20*60) 
+#define TIME_TO_FADE (10*60) 
+
+// TODO: Adjust Max LED PWM brightness based on your controller
+// Arduino 8-bit = 255
+// Teensy 10-bit = 1023, 12-bit = 4095
+#define LED_MAX_PWM_OUTPUT 255
+#define ANALOG_RESOLUTION_BITS 8
 
 // TODO: Turn the alarm on/off for each day of the week
 bool AlarmOnDays[] = { false, true, true, true, true, false, false };   // array={Su,M,Tu,W,Th,F,Sa}
@@ -84,16 +128,20 @@ const String DaysOfTheWeek[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thu
 
 #define CONST_DEAD 0xDEAD
 #define CONST_BEEF 0xBEEF
+#define CONST_SETTINGS_VERSION 1
 struct ClockSettings {
   unsigned int dead = CONST_DEAD;    // To test if settings are read correctly from EEPROM
+  int SettingsVersion;
   int LCDBrightness;    // 0-15
-  int MaxLEDBrightness; // 0-255
+  int MaxLEDBrightness; // 0 - LED_MAX_PWM_OUTPUT
   bool Use24HR;
   bool AlarmDays[7];
   int Alarm1Hours;
   int Alarm1Minutes;
   int Alarm2Hours;        // Alarm2 not currently in use
   int Alarm2Minutes;
+  bool Alarm1Enabled;
+  bool Alarm2Enabled;
   unsigned int beef = CONST_BEEF;    // To test if settings are read correctly from EEPROM
 };
 
@@ -147,15 +195,18 @@ void setup() {
 
   // Default Settings
   CurrentSettings.LCDBrightness = 15;
-  CurrentSettings.MaxLEDBrightness = 255;
+  CurrentSettings.MaxLEDBrightness = LED_MAX_PWM_OUTPUT;
   CurrentSettings.Use24HR = false;
   CurrentSettings.Alarm1Hours = AlarmTime.hours();
   CurrentSettings.Alarm1Minutes = AlarmTime.minutes();
   CurrentSettings.Alarm2Hours = AlarmTime.hours();
   CurrentSettings.Alarm2Minutes = AlarmTime.minutes();
+  CurrentSettings.Alarm1Enabled = true;
+  CurrentSettings.Alarm2Enabled = false;
   ReadEEprom();
   CurrentSettings.dead = CONST_DEAD;
   CurrentSettings.beef = CONST_BEEF;
+  CurrentSettings.SettingsVersion = CONST_SETTINGS_VERSION;
 
   if (! rtc.begin()) {    
     while (1) {
@@ -177,10 +228,19 @@ void setup() {
   UserSunrise = false;
   UserDateTime = rtc.now(); // Initialize variable, though we are not using it yet
 
-  // Clear the display
-  matrix.begin(SEVENSEG_ADDR);
-  matrix.setBrightness(CurrentSettings.LCDBrightness % 16);    // 0-15
+  // Clear the displays
+  if (USE_SEVENSEG)
+  {
+    matrix.begin(SEVENSEG_ADDR);
+    matrix.setBrightness(CurrentSettings.LCDBrightness % 16);    // 0-15
+  }
+  if (USE_LCD)
+    lcd.begin(LCD_COLS, LCD_ROWS);
 
+#ifdef USING_TEENSY_SETTINGS
+  analogWriteResolution(ANALOG_RESOLUTION_BITS);
+#endif
+  
   pinMode(ledPin, OUTPUT);
   encoder = new ClickEncoder(encLow, encHigh, encBtn, 4, LOW);    // Adafruit #377 encoder = 4 steps/notch
   encoder->setAccelerationEnabled(false);
@@ -202,7 +262,7 @@ void loop() {
 
   // Adjust the lights
   int fade = max(GetAlarmFade(), GetUserFade());
-  analogWrite(ledPin, map(fade, 0, 255, 0, CurrentSettings.MaxLEDBrightness));
+  analogWrite(ledPin, map(fade, 0, LED_MAX_PWM_OUTPUT, 0, CurrentSettings.MaxLEDBrightness));
 }
 
 // timerIsr(): called once per ms by Timer1 to handle rotary encoder without using interrupt pins
@@ -220,18 +280,138 @@ String FormatHMS(int val, bool addzero = true) {
     return String(val);
 }
 
+String CenterString(String str, int columns = LCD_COLS) {  
+  int diff = (columns - str.length())/2;
+  for (int sp = 0; sp < diff; sp++)
+    str = " " + str;
+  for (int sp = str.length(); sp < columns; sp++)
+    str += " ";   
+  return str.substring(0, 20);
+}
+
 // UpdateDisplay(): Update the 7-segment clock display
 void UpdateDisplay() {
   int hr = hours;
+  String ampm = "";
 
-  if (!CurrentSettings.Use24HR && hr > 12)
-    hr -= 12;
+  if (!CurrentSettings.Use24HR)  
+  {
+    if (hr > 12)
+    {
+      hr -= 12;
+      ampm = " PM";
+    }
+    else if (hr == 12)
+      ampm = " PM";
+    else 
+      ampm = " AM";
+  }
+  
+  if (USE_SEVENSEG)
+  {
+    matrix.print((hr*100) + minutes);
+    matrix.drawColon(true);
+    matrix.writeDisplay();
+  }
+  if (USE_LCD)
+  {
+    //lcd.clear();
+    String str;
+    lcd.setCursor(0, 0);
+    str = String(hr) + ":" + FormatHMS(minutes) + ":" + FormatHMS(seconds) + ampm;
+    lcd.print(CenterString(str, LCD_COLS));
+    lcd.setCursor(0, 1);
+    if (LCD_COLS == 20)
+      str = DaysOfTheWeek[CurrentTime.dayOfTheWeek()];
+    else
+      str = DaysOfTheWeek[CurrentTime.dayOfTheWeek()].substring(0,3);
+    str += " " + FormatHMS(CurrentTime.month()) + "/" + FormatHMS(CurrentTime.day()) + "/" + CurrentTime.year(); 
+    lcd.print(CenterString(str, LCD_COLS));
+    
+    if (LCD_ROWS == 4)
+    {
+      lcd.setCursor(0, 2);
+      ampm = "";
+      hr = AlarmDateTime.hour();
+      if (!CurrentSettings.Use24HR)  
+      {
+        if (hr > 12)
+        {
+          hr -= 12;
+          ampm = " PM";
+        }
+        else 
+          ampm = " AM";
+      }
+      int next = NextAlarmDayOfWeek();
+      str = "Alarm ";
+      if ((next < 0 || next >= 7) || !CurrentSettings.Alarm1Enabled)
+      {
+        str += "Off";
+        lcd.print(CenterString(str, LCD_COLS));
+        lcd.setCursor(0, 3);
+        lcd.print(CenterString(" ", LCD_COLS));
+      }
+      else
+      {
+        str += String(hr) + ":" + FormatHMS(AlarmDateTime.minute()) + ampm;
+        lcd.print(CenterString(str, LCD_COLS));
 
-  matrix.print((hr*100) + minutes);
-  matrix.drawColon(true);
-  matrix.writeDisplay();
+        lcd.setCursor(0, 3);
+        if (next >= 0 && next < 7)
+        {
+          str = "Next: ";
+          if (next == CurrentTime.dayOfTheWeek() && 
+            (CurrentTime.hour() < AlarmDateTime.hour()) &&
+            (CurrentTime.minute() < AlarmDateTime.minute()))
+            str += "Today";
+          else if (next == (CurrentTime.dayOfTheWeek()+1)%7)
+            str += "Tomorrow";
+          else 
+            str += DaysOfTheWeek[next];
+          lcd.print(CenterString(str, LCD_COLS));
+        }
+      }      
+    }
+  }
   
   Serial.println(DaysOfTheWeek[CurrentTime.dayOfTheWeek()] + " " + FormatHMS(hours) + ":" + FormatHMS(minutes) + ":" + FormatHMS(seconds) + " (" + String(millisec) + " ms) Fade=" + String(GetAlarmFade()));
+}
+
+int NextAlarmDayOfWeek() {
+  bool enabled = false;
+  // check if at least one day is enabled
+  for (int d = 0; d < 7; d++)
+    if (AlarmOnDays[d])
+      enabled = true;
+  if (!enabled) 
+    return -1;
+    
+  int dow = CurrentTime.dayOfTheWeek();
+  dow %= 7; // just in case
+  
+  do 
+  {
+    if (AlarmOnDays[dow])
+    {
+      if (dow == CurrentTime.dayOfTheWeek() && 
+        (hours < AlarmDateTime.hour()) &&
+        (minutes < AlarmDateTime.minute()))
+        break;
+      else if (dow != CurrentTime.dayOfTheWeek())
+        break;
+      else
+        dow++;
+    }
+    else 
+      dow++;  // increment
+    dow %= 7; // loop around 7 days
+  }
+  while (dow != CurrentTime.dayOfTheWeek());
+
+  //Serial.println("Next alarm day is " + DaysOfTheWeek[dow]);
+  
+  return dow;  
 }
 
 // ReadEEprom(): restore settings after power loss
@@ -246,6 +426,9 @@ void ReadEEprom() {
   stmp.toUpperCase();
   Serial.println("Offset " + String(offset) + ": dead = 0x" + stmp);
   offset += sizeof(dead);
+  EEPROM.get(offset, tmpset.SettingsVersion);
+  Serial.println("Offset " + String(offset) + ": SettingsVersion = " + String(tmpset.SettingsVersion));
+  offset += sizeof(ClockSettings::SettingsVersion);
   EEPROM.get(offset, tmpset.LCDBrightness);
   Serial.println("Offset " + String(offset) + ": LCDBrightness = " + String(tmpset.LCDBrightness));
   offset += sizeof(ClockSettings::LCDBrightness);
@@ -273,6 +456,14 @@ void ReadEEprom() {
   EEPROM.get(offset, tmpset.Alarm2Minutes);
   Serial.println("Offset " + String(offset) + ": Alarm2Minutes = " + String(tmpset.Alarm2Minutes));
   offset += sizeof(ClockSettings::Alarm2Minutes);
+  EEPROM.get(offset, tmpset.Alarm1Enabled);
+  Serial.print("Offset " + String(offset));
+  Serial.println(tmpset.Alarm1Enabled ? ": Alarm 1 On" : ": Alarm 1 Off");
+  offset += sizeof(ClockSettings::Alarm1Enabled);
+  EEPROM.get(offset, tmpset.Alarm2Enabled);
+  Serial.print("Offset " + String(offset));
+  Serial.println(tmpset.Alarm2Enabled ? ": Alarm 2 On" : ": Alarm 2 Off");
+  offset += sizeof(ClockSettings::Alarm2Enabled);
   EEPROM.get(offset, beef);
   stmp = String(beef, HEX);
   stmp.toUpperCase();
@@ -304,6 +495,10 @@ void WriteEEprom() {
   if (tmpset.dead != CONST_DEAD)
     EEPROM.put(offset, CONST_DEAD);
   offset += sizeof(ClockSettings::dead);
+  Serial.println("Offset " + String(offset) + ": SettingsVersion = " + String(CurrentSettings.SettingsVersion));
+  if (tmpset.SettingsVersion != CurrentSettings.SettingsVersion)
+    EEPROM.put(offset, CurrentSettings.SettingsVersion);
+  offset += sizeof(ClockSettings::SettingsVersion);
   Serial.println("Offset " + String(offset) + ": LCDBrightness = " + String(CurrentSettings.LCDBrightness));
   if (tmpset.LCDBrightness != CurrentSettings.LCDBrightness)
     EEPROM.put(offset, CurrentSettings.LCDBrightness);
@@ -346,6 +541,16 @@ void WriteEEprom() {
   if (tmpset.Alarm2Minutes != CurrentSettings.Alarm2Minutes)
     EEPROM.put(offset, CurrentSettings.Alarm2Minutes);
   offset += sizeof(ClockSettings::Alarm2Minutes);
+  Serial.print("Offset " + String(offset));
+  Serial.println(CurrentSettings.Alarm1Enabled ? ": Alarm 1 On" : ": Alarm 1 Off");
+  if (tmpset.Alarm1Enabled != CurrentSettings.Alarm1Enabled)
+    EEPROM.put(offset, CurrentSettings.Alarm1Enabled);
+  offset += sizeof(ClockSettings::Alarm1Enabled);
+  Serial.print("Offset " + String(offset));
+  Serial.println(CurrentSettings.Alarm2Enabled ? ": Alarm 2 On" : ": Alarm 2 Off");
+  if (tmpset.Alarm2Enabled != CurrentSettings.Alarm2Enabled)
+    EEPROM.put(offset, CurrentSettings.Alarm2Enabled);
+  offset += sizeof(ClockSettings::Alarm2Enabled);
   stmp = String(CurrentSettings.beef, HEX);
   stmp.toUpperCase();
   Serial.println("Offset " + String(offset) + ": beef = 0x" + stmp);
@@ -377,6 +582,11 @@ void CheckButtonState() {
         Serial.println("ClickEncoder::Held, starting sunrise");
         break;
       case ClickEncoder::Clicked:
+        if (max(GetAlarmFade(), GetUserFade()) == 0)
+        {
+          // Alarm is not running
+          CurrentSettings.Alarm1Enabled = !CurrentSettings.Alarm1Enabled;
+        }
         // Turn off lights if they are on
         Cancelled = !Cancelled;
         UserSunrise = false;
@@ -394,7 +604,20 @@ void CheckButtonState() {
 
 // StartUserFade(): begin sunrise sequence right now, does not repeat automatically
 void StartUserFade() {
-  UserDateTime = rtc.now();
+  int h = 0;
+  int m = 0;
+  int s = 0;
+  int ttf = TIME_TO_FADE;
+  if (ttf > (60*60)) {    // over 1 hour
+    s = ttf % (60*60);
+    h = (ttf - s) / (60*60);  // number of hours
+  }
+  if (s > 60) {   // over 1 minute
+    ttf = s;
+    s = ttf % 60;
+    m = (ttf - m) / 60; // number of minutes
+  }
+  UserDateTime = rtc.now() + TimeSpan(0,h,m,s);
   UserSunrise = true;
 }
 
@@ -449,11 +672,14 @@ void GetCurrentTime() {
 
 // FlashDisplay(): Flash the entire display on/off, for use when entering settings modes
 void FlashDisplay(int count = 3, int delayms = 100) {
-  for (int c = 0; c < count; c++) {
-    matrix.setBrightness(0);
-    delay(delayms);
-    matrix.setBrightness(CurrentSettings.LCDBrightness % 16);
-    delay(delayms);
+  if (USE_SEVENSEG)
+  {
+    for (int c = 0; c < count; c++) {
+      matrix.setBrightness(0);
+      delay(delayms);
+      matrix.setBrightness(CurrentSettings.LCDBrightness % 16);
+      delay(delayms);
+    }
   }
 }
 
@@ -465,10 +691,17 @@ void SetupMode() {
   // Set the max LED output brightness
   // Save settings to EEPROM in case of power failure
 
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Setup Mode")); 
+  }
   Set12hr24hr();
   SetClock();
   SetAlarm1Time();
-  SetLcdBrightness();
+  if (USE_SEVENSEG)
+    SetLcdBrightness();
   SetMaxLedBrightness();
   encoder->setAccelerationEnabled(false);  
   analogWrite(ledPin, 0);
@@ -478,7 +711,20 @@ void SetupMode() {
 // Set12hr24hr(): Choose 12-hr or 24-hr display mode
 void Set12hr24hr() {
   // Set the 12/24 hr mode
-  FlashDisplay();
+
+
+  if (USE_SEVENSEG)
+  {
+    FlashDisplay();
+  }
+  delay(200);
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print(CenterString("Clock Display"));
+  }
+  
   encoder->setAccelerationEnabled(false);
   while (encoder->getButton() != ClickEncoder::Clicked) {
     //encoder->service();
@@ -486,34 +732,60 @@ void Set12hr24hr() {
     if (newPosition != oldPosition) {
       CurrentSettings.Use24HR = !CurrentSettings.Use24HR;
       oldPosition = newPosition;
-      if (CurrentSettings.Use24HR) Serial.println("Using 24hr mode");
-       else        Serial.println("Using 12hr mode");
+      if (CurrentSettings.Use24HR)
+        Serial.println("Using 24hr mode");
+      else
+        Serial.println("Using 12hr mode");
     }
     // Display 12hr / 24hr for setting display
-    matrix.drawColon(false);
-    if (CurrentSettings.Use24HR) {
-      matrix.writeDigitNum(0, 2, false);
-      matrix.writeDigitNum(1, 4, false);
+    if (USE_SEVENSEG)
+    {
+      matrix.drawColon(false);
+        
+      if (CurrentSettings.Use24HR) {
+        matrix.writeDigitNum(0, 2, false);
+        matrix.writeDigitNum(1, 4, false);
+      }
+      else {
+        matrix.writeDigitNum(0, 1, false);
+        matrix.writeDigitNum(1, 2, false);
+      }
+      matrix.writeDigitRaw(3, CHAR7_h); //h
+      matrix.writeDigitRaw(4, CHAR7_r); //r
+      matrix.writeDisplay();     
     }
-    else {
-      matrix.writeDigitNum(0, 1, false);
-      matrix.writeDigitNum(1, 2, false);
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,1);
+      if (CurrentSettings.Use24HR)
+        lcd.print(CenterString("24 Hour mode"));
+      else
+        lcd.print(CenterString("12 Hour (AM/PM)"));
     }
-    matrix.writeDigitRaw(3, CHAR7_h); //h
-    matrix.writeDigitRaw(4, CHAR7_r); //r
-    matrix.writeDisplay();     
   }
 }
 
 // SetClock(): Set the RTC Clock time
 void SetClock() {
-  FlashDisplay(1);
-  matrix.drawColon(false);
-  matrix.writeDigitRaw(0, CHAR7_C);
-  matrix.writeDigitRaw(1, CHAR7_l);
-  matrix.writeDigitRaw(3, CHAR7_o);
-  matrix.writeDigitRaw(4, CHAR7_c);
-  matrix.writeDisplay();
+  if (USE_SEVENSEG)
+  {
+    FlashDisplay(1);
+    matrix.drawColon(false);
+    matrix.writeDigitRaw(0, CHAR7_C);
+    matrix.writeDigitRaw(1, CHAR7_l);
+    matrix.writeDigitRaw(3, CHAR7_o);
+    matrix.writeDigitRaw(4, CHAR7_c);
+    matrix.writeDisplay();
+  }
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Time"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  
   delay(400);
   GetCurrentTime();
   encoder->setAccelerationEnabled(false);  
@@ -532,6 +804,14 @@ int SetClockHours() {
   int hrc = CHAR7_H;
   bool OnOff = true;
 
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Hour"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
   // Flash "Hour A/P" (ex. "10 A") or "Hour24 H" (ex. "15 H")
   newPosition = hrtmp;
   while (encoder->getButton() != ClickEncoder::Clicked) {
@@ -562,26 +842,33 @@ int SetClockHours() {
       hr1 = (hrtmp - hr2) / 10;
     }
     // Update display
-    if (OnOff) {
-      matrix.drawColon(true);
-      if (hr1 > 0)
-        matrix.writeDigitNum(0, hr1, false);
-      else 
+    if (USE_SEVENSEG)
+    {
+      if (OnOff) {
+        matrix.drawColon(true);
+        if (hr1 > 0)
+          matrix.writeDigitNum(0, hr1, false);
+        else 
+          matrix.writeDigitRaw(0, 0);
+        matrix.writeDigitNum(1, hr2, false);
+      }
+      else {
+        matrix.drawColon(false);
         matrix.writeDigitRaw(0, 0);
-      matrix.writeDigitNum(1, hr2, false);
+        matrix.writeDigitRaw(1, 0);
+      }
+      matrix.writeDigitRaw(3, 0);
+      matrix.writeDigitRaw(4, hrc);
+      matrix.writeDisplay();
     }
-    else {
-      matrix.drawColon(false);
-      matrix.writeDigitRaw(0, 0);
-      matrix.writeDigitRaw(1, 0);
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(hrtmp) + ":" + FormatHMS(CurrentTime.minute())));
     }
-    matrix.writeDigitRaw(3, 0);
-    matrix.writeDigitRaw(4, hrc);
-    matrix.writeDisplay();
-
     newPosition += encoder->getValue();
     if (newPosition != hrtmp) {
-      Serial.print("Encoder " + String(newPosition) + ", ");
+      //Serial.print("Encoder " + String(newPosition) + ", ");
       if (newPosition < 0) newPosition = 23;
       newPosition %= 24;
       hrtmp = newPosition;
@@ -605,9 +892,17 @@ int SetClockMinutes(int hrtmp) {
   }
   hr2 = hrtmp % 10;
   hr1 = (hrtmp - hr2) / 10;
-    
   bool OnOff = true;
 
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Minutes"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  
   // Flash ":MIN" (ex. ":15")
   newPosition = mintmp;
   while (encoder->getButton() != ClickEncoder::Clicked) {
@@ -616,26 +911,33 @@ int SetClockMinutes(int hrtmp) {
     min2 = mintmp % 10;
     min1 = (mintmp - min2) / 10;
     // Update display
-    if (hr1 > 0)
-      matrix.writeDigitNum(0, hr1, false);
-    else
-      matrix.writeDigitRaw(0, 0);
-    matrix.writeDigitNum(1, hr2, false);
-    if (OnOff) {
-      matrix.drawColon(true);
-      matrix.writeDigitNum(3, min1, false);
-      matrix.writeDigitNum(4, min2, false);
+    if (USE_SEVENSEG)
+    {
+      if (hr1 > 0)
+        matrix.writeDigitNum(0, hr1, false);
+      else
+        matrix.writeDigitRaw(0, 0);
+      matrix.writeDigitNum(1, hr2, false);
+      if (OnOff) {
+        matrix.drawColon(true);
+        matrix.writeDigitNum(3, min1, false);
+        matrix.writeDigitNum(4, min2, false);
+      }
+      else {
+        matrix.drawColon(false);
+        matrix.writeDigitRaw(3, 0);
+        matrix.writeDigitRaw(4, 0);
+      }
+      matrix.writeDisplay();
     }
-    else {
-      matrix.drawColon(false);
-      matrix.writeDigitRaw(3, 0);
-      matrix.writeDigitRaw(4, 0);
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(CurrentTime.hour()) + ":" + FormatHMS(mintmp)));
     }
-    matrix.writeDisplay();
-
     newPosition += encoder->getValue();
     if (newPosition != mintmp) {
-      Serial.print("Encoder " + String(newPosition) + ", ");
+      //Serial.print("Encoder " + String(newPosition) + ", ");
       if (newPosition < 0) newPosition = 59;
       newPosition %= 60;
       mintmp = newPosition;
@@ -648,13 +950,24 @@ int SetClockMinutes(int hrtmp) {
 // SetAlarm1Time(), SetAlarm1Hours(), SetAlarm1Minutes(): Set the peak alarm time (lights fully on)
 void SetAlarm1Time() {
   // Set the Alarm1 time
+    if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Alarm"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
   FlashDisplay(1);
-  matrix.drawColon(false);
-  matrix.writeDigitRaw(0, CHAR7_A);
-  matrix.writeDigitRaw(1, CHAR7_L);
-  matrix.writeDigitRaw(3, 0);
-  matrix.writeDigitNum(4, 1, false);
-  matrix.writeDisplay();
+  if (USE_SEVENSEG)
+  {
+    matrix.drawColon(false);
+    matrix.writeDigitRaw(0, CHAR7_A);
+    matrix.writeDigitRaw(1, CHAR7_L);
+    matrix.writeDigitRaw(3, 0);
+    matrix.writeDigitNum(4, 1, false);
+    matrix.writeDisplay();
+  }
   delay(400);
   encoder->setAccelerationEnabled(false);  
   SetAlarm1Hours();
@@ -669,7 +982,17 @@ void SetAlarm1Hours() {
   int hrtmp = 0;
   int hrc = CHAR7_H;
   bool OnOff = true;
+  String ampm = "";
 
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Alarm Hour"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  
   // Flash "Hour A/P" (ex. "10 A") or "Hour24 H" (ex. "15 H")
   newPosition = CurrentSettings.Alarm1Hours;
   while (encoder->getButton() != ClickEncoder::Clicked) {
@@ -680,47 +1003,60 @@ void SetAlarm1Hours() {
       hrc = CHAR7_H;
       hr2 = CurrentSettings.Alarm1Hours % 10;
       hr1 = (CurrentSettings.Alarm1Hours - hr2) / 10;
+      ampm = "";
     }
     else {
       hrtmp = CurrentSettings.Alarm1Hours;
       if (hrtmp > 12) {
         hrc = CHAR7_P;
         hrtmp -= 12;
+        ampm = " PM";
       }
       else if (hrtmp == 12) {
         hrc = CHAR7_P;
+        ampm = " PM";
       }
       else if (hrtmp > 1) {
         hrc = CHAR7_A;
+        ampm = " AM";
       }
       else if (hrtmp == 0) {    // 0-hour (12A)
         hrc = CHAR7_A;
         hrtmp = 12;
+        ampm = " AM";
       }
       hr2 = hrtmp % 10;
       hr1 = (hrtmp - hr2) / 10;
     }
     // Update display
-    if (OnOff) {
-      matrix.drawColon(true);
-      if (hr1 > 0)
-        matrix.writeDigitNum(0, hr1, false);
-      else 
+    if (USE_SEVENSEG)
+    {
+      if (OnOff) {
+        matrix.drawColon(true);
+        if (hr1 > 0)
+          matrix.writeDigitNum(0, hr1, false);
+        else 
+          matrix.writeDigitRaw(0, 0);
+        matrix.writeDigitNum(1, hr2, false);
+      }
+      else {
+        matrix.drawColon(false);
         matrix.writeDigitRaw(0, 0);
-      matrix.writeDigitNum(1, hr2, false);
+        matrix.writeDigitRaw(1, 0);
+      }
+      matrix.writeDigitRaw(3, 0);
+      matrix.writeDigitRaw(4, hrc);
+      matrix.writeDisplay();
     }
-    else {
-      matrix.drawColon(false);
-      matrix.writeDigitRaw(0, 0);
-      matrix.writeDigitRaw(1, 0);
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(hrtmp) + ":" + FormatHMS(CurrentSettings.Alarm1Minutes) + ampm));
     }
-    matrix.writeDigitRaw(3, 0);
-    matrix.writeDigitRaw(4, hrc);
-    matrix.writeDisplay();
-
+    
     newPosition += encoder->getValue();
     if (newPosition != CurrentSettings.Alarm1Hours) {
-      Serial.print("Encoder " + String(newPosition) + ", ");
+      //Serial.print("Encoder " + String(newPosition) + ", ");
       if (newPosition < 0) newPosition = 23;
       newPosition %= 24;
       CurrentSettings.Alarm1Hours = newPosition;
@@ -731,20 +1067,38 @@ void SetAlarm1Hours() {
 }
 
 void SetAlarm1Minutes() {
+  String atime;
+  String ampm = "";
   int hr1, hr2, hrtmp, min1, min2;
   min1 = min2 = 0;
   hrtmp = CurrentSettings.Alarm1Hours;
   if (CurrentSettings.Use24HR) {
+    ampm = "";
     if (hrtmp > 12)
       hrtmp -= 12;
     else if (hrtmp == 0)
       hrtmp = 12;
   }
+  else
+  {
+    if (hrtmp >= 12)
+      ampm = " PM";
+    else 
+      ampm = " AM";
+  }
   hr2 = hrtmp % 10;
   hr1 = (hrtmp - hr2) / 10;
-    
   bool OnOff = true;
 
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Alarm Minutes"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  
   // Flash ":MIN" (ex. ":15")
   newPosition = CurrentSettings.Alarm1Minutes;
   while (encoder->getButton() != ClickEncoder::Clicked) {
@@ -753,23 +1107,31 @@ void SetAlarm1Minutes() {
     min2 = CurrentSettings.Alarm1Minutes % 10;
     min1 = (CurrentSettings.Alarm1Minutes - min2) / 10;
     // Update display
-    if (hr1 > 0)
-      matrix.writeDigitNum(0, hr1, false);
-    else
-      matrix.writeDigitRaw(0, 0);
-    matrix.writeDigitNum(1, hr2, false);
-    if (OnOff) {
-      matrix.drawColon(true);
-      matrix.writeDigitNum(3, min1, false);
-      matrix.writeDigitNum(4, min2, false);
+    if (USE_SEVENSEG)
+    {
+      if (hr1 > 0)
+        matrix.writeDigitNum(0, hr1, false);
+      else
+        matrix.writeDigitRaw(0, 0);
+      matrix.writeDigitNum(1, hr2, false);
+      if (OnOff) {
+        matrix.drawColon(true);
+        matrix.writeDigitNum(3, min1, false);
+        matrix.writeDigitNum(4, min2, false);
+      }
+      else {
+        matrix.drawColon(false);
+        matrix.writeDigitRaw(3, 0);
+        matrix.writeDigitRaw(4, 0);
+      }
+      matrix.writeDisplay();
     }
-    else {
-      matrix.drawColon(false);
-      matrix.writeDigitRaw(3, 0);
-      matrix.writeDigitRaw(4, 0);
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(hrtmp) + ":" + FormatHMS(CurrentSettings.Alarm1Minutes) + ampm));
     }
-    matrix.writeDisplay();
-
+    
     newPosition += encoder->getValue();
     if (newPosition != CurrentSettings.Alarm1Minutes) {
       Serial.print("Encoder " + String(newPosition) + ", ");
@@ -784,6 +1146,18 @@ void SetAlarm1Minutes() {
 
 // SetLcdBrightness: Set the LCD display brightness, range 0-15 for Adafruit I2C backpack
 void SetLcdBrightness() {  
+  if (!USE_SEVENSEG)
+    return;
+      
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Clock Brightness"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  
   FlashDisplay(1);
   matrix.drawColon(false);
   matrix.writeDigitRaw(0, CHAR7_L);
@@ -798,9 +1172,15 @@ void SetLcdBrightness() {
     //encoder->service();
     matrix.print(CurrentSettings.LCDBrightness);
     matrix.writeDisplay();
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(CurrentSettings.LCDBrightness)));
+    }
+    
     newPosition += encoder->getValue();
     if (newPosition != CurrentSettings.LCDBrightness) {
-      Serial.print("Encoder " + String(newPosition) + ", ");
+      //Serial.print("Encoder " + String(newPosition) + ", ");
       if (newPosition < 0) newPosition = 15;
       newPosition %= 16;
       CurrentSettings.LCDBrightness = newPosition;
@@ -812,31 +1192,49 @@ void SetLcdBrightness() {
 
 // SetMaxLedBrightness(): Set the max LED output brightness for the Sunrise
 void SetMaxLedBrightness() {
-  FlashDisplay(1);
-  matrix.drawColon(false);
-  matrix.writeDigitRaw(0, CHAR7_O);
-  matrix.writeDigitRaw(1, CHAR7_u);
-  matrix.writeDigitRaw(3, CHAR7_t);
-  matrix.writeDigitRaw(4, 0);
-  matrix.writeDisplay();
+  if (USE_LCD)
+  {
+    lcd.clear();
+    lcd.setCursor(0,LCD_ROWS/2 - 1);
+    lcd.print(CenterString("Set Max Sunlight"));
+    lcd.setCursor(0,LCD_ROWS/2);
+    lcd.print(CenterString(" "));
+  }
+  if (USE_SEVENSEG)
+  {
+    FlashDisplay(1);
+    matrix.drawColon(false);
+    matrix.writeDigitRaw(0, CHAR7_O);
+    matrix.writeDigitRaw(1, CHAR7_u);
+    matrix.writeDigitRaw(3, CHAR7_t);
+    matrix.writeDigitRaw(4, 0);
+    matrix.writeDisplay();
+  }
   delay(400);
   encoder->setAccelerationEnabled(true);
-  if (CurrentSettings.MaxLEDBrightness > 255 || CurrentSettings.MaxLEDBrightness < 0)
-    CurrentSettings.MaxLEDBrightness = 255;
+  if (CurrentSettings.MaxLEDBrightness > LED_MAX_PWM_OUTPUT || CurrentSettings.MaxLEDBrightness < 0)
+    CurrentSettings.MaxLEDBrightness = LED_MAX_PWM_OUTPUT;
   newPosition = CurrentSettings.MaxLEDBrightness;
   while (encoder->getButton() != ClickEncoder::Clicked) {
     //encoder->service();
-    matrix.print(CurrentSettings.MaxLEDBrightness);
-    matrix.writeDisplay();
+    if (USE_SEVENSEG)
+    {
+      matrix.print(CurrentSettings.MaxLEDBrightness);
+      matrix.writeDisplay();
+    }
+    if (USE_LCD)
+    {
+      lcd.setCursor(0,LCD_ROWS/2);
+      lcd.print(CenterString(String(CurrentSettings.MaxLEDBrightness)));
+    }
     analogWrite(ledPin, CurrentSettings.MaxLEDBrightness);
     newPosition += encoder->getValue();
     if (newPosition != CurrentSettings.MaxLEDBrightness) {
-      Serial.print("Encoder " + String(newPosition) + ", ");
-      if (newPosition < 0) newPosition = 255;
-      newPosition %= 256;
+      //Serial.print("Encoder " + String(newPosition) + ", ");
+      if (newPosition < 0) newPosition = LED_MAX_PWM_OUTPUT;
+      newPosition %= LED_MAX_PWM_OUTPUT+1;
       CurrentSettings.MaxLEDBrightness = newPosition;
       Serial.println("Max LED Brightness = " + String(CurrentSettings.MaxLEDBrightness));
     }
   }
 }
-
